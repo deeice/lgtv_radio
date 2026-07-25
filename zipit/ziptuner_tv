@@ -1,0 +1,28 @@
+
+# Set configuration variables for LG webOS TV
+IP="192.168.1.22"
+KEY="459222e6f85ee326a5fe40d4f2e7f585"
+
+# 1. Persistent 5-second countdown reminder window
+dialog --backtitle " Zippy Internet Radio Tuner" \
+       --title " [ REMINDER ] " \
+       --pause "\nTurn on the TV and adjust the volume." 10 42 4
+
+# 2. Check for favorite stations
+if [ -f ziptuner.fav ] ; then
+    dialog --clear --title " Zippy Internet Radio Tuner" --yesno " Resume playing favorite?" 0 0
+    [ $? -eq 0 ] && A="-a" || A=
+fi
+
+# 3. Run ziptuner
+./ziptuner $A -u \
+  -p "lgtv_radio $IP $KEY '%s' >/tmp/lgtv_play.log 2>&1" \
+  -s "lgtv_radio $IP $KEY STOP >/tmp/lgtv_stop.log 2>&1" \
+  playlist.pls
+
+#./ziptuner $A -u \
+#  -p "2>&1 >/tmp/lgtv_play.log ./lgtv_log $IP $KEY " \
+#  -s "2>&1 >/tmp/lgtv_stop.log ./lgtv_log $IP $KEY STOP" \
+#  playlist.pls
+
+
