@@ -1,4 +1,4 @@
-# lgtv_radio
+# lgtv_radio ![lgtuner](zipit/lgtuner.png)
 
 Tiny command line tool to push internet radio URLs from a computer to an LG webOS TV and have it play them.
 
