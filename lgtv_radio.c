@@ -110,8 +110,8 @@ int dlna_scan() {
 	    }
 	    else {
                 char *end;
-		if (end = strpbrk(loc, "\r\n")) *end = 0;
-		if (end = strpbrk(srv, "\r\n")) *end = 0;
+		if ((end = strpbrk(loc, "\r\n"))) *end = 0;
+		if ((end = strpbrk(srv, "\r\n"))) *end = 0;
                 printf("%s\n", loc);
                 printf("%s\n", srv);
 
@@ -437,7 +437,7 @@ int main(int argc, char *argv[]) {
 #endif // DIG_DEEPER
     
     // =========================================================================
-    // 2. PRISTINE TV MASTER HANDLE
+    //  Create a fresh clean TV master curl handle
     // =========================================================================
     // This handle is now guaranteed to be 100% unpolluted by internet HTTP states
     CURL *curl = curl_easy_init();
@@ -570,11 +570,11 @@ int main(int argc, char *argv[]) {
         }
     } while (loop_running);
 
-    // CRITICAL FIX: Give webOS 24 a clean 250ms window to completely 
-    // finalize your session token authorization states before throwing an 
-    // app launch payload onto the wire. This clears the 401 error.
+    // Give webOS .5 sec to finalize the session token authorization before app launch.
+    // (avoids a 401 error)
     //usleep(250000);
-    usleep(1250000);
+    usleep(500000);
+    //usleep(1250000);
 
     // 3. Transmit Play or Stop Command String
     if (strlen(stream_url) > 0 && registered_confirmed) {

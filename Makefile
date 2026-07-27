@@ -9,7 +9,7 @@ all: $(TARGET)
 
 $(TARGET): $(SRCS)
 	$(CC) $(CFLAGS) $(SRCS) -o $(TARGET) $(LDFLAGS)
-	sstrip $(TARGET)
+	strip $(TARGET)
 
 clean:
 	rm -f $(TARGET)
