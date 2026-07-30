@@ -492,7 +492,7 @@ int main(int argc, char *argv[]) {
     // Set a total operational ceiling timeout of 6 seconds for the entire script execution.
     curl_easy_setopt(curl, CURLOPT_TIMEOUT, 6L);
     
-    printf("[DEBUG] Executing secure TLS Handshake via tiny-curl engine...\n");
+    printf("[DEBUG] Executing secure TLS Handshake...\n");
     CURLcode res = curl_easy_perform(curl);
     if (res != CURLE_OK) {
         fprintf(stderr, "[ERROR] Handshake failed: %s\n", curl_easy_strerror(res));
@@ -591,6 +591,7 @@ int main(int argc, char *argv[]) {
                 loop_running = 0;
                 break;
             }
+	    // printf("."); fflush(stdout);  // Add this to debug unhandled scenarios.
             usleep(100000); // Sleep 100ms per cycle to keep Z2 CPU usage at 0%
             continue;
         }
@@ -601,6 +602,11 @@ int main(int argc, char *argv[]) {
             
             printf("[DEBUG] TV FRAME: %s\n", json_segment);
 
+            // Notify User about the prompt displayed on the TV screen.
+            if (strstr(json_segment, "\"pairingType\":\"PROMPT\"") || strstr(json_segment, "prompt")) {
+                printf("[INFO] Please click 'ACCEPT' on the TV screen...\n");
+            }
+	    
             // Explicit Error Check: TV sent a refusal frame before disconnecting
             if (strstr(json_segment, "\"error\"") || strstr(json_segment, "denied")) {
                 fprintf(stderr, "[ERROR] Pairing explicitly rejected by user on-screen.\n");
@@ -627,7 +633,7 @@ int main(int argc, char *argv[]) {
             else if (strstr(json_segment, "Try Again Later") != NULL) {
                 loop_running = 0; 
 	    }	      
-        } else if (res != CURLE_OK) {
+	} else if (res != CURLE_OK || bytes_read == 0) {	  
             fprintf(stderr, "[ERROR] Network stream read fault code: %s\n", curl_easy_strerror(res));
             loop_running = 0;
         }
