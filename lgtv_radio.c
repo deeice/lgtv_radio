@@ -336,6 +336,34 @@ int raw_socket_recv(CURL *curl, char *output_buf, size_t max_size) {
  * "{\"type\":\"request\",\"id\":\"zip_auth\",\"uri\":\"ssap://audio/setMute\",\"payload\":{\"mute\":true}}"
  */
 
+char *get_key(char * parsed_string) {
+    static char extracted_key[64];
+
+    memset(extracted_key, 0, sizeof(extracted_key));
+    if (parsed_string) {
+        for (size_t i = 0; parsed_string[i] != '\0'; i++) {
+            if (parsed_string[i] >= 'A' && parsed_string[i] <= 'Z') {
+                parsed_string[i] = parsed_string[i] + 32;
+            }
+        }
+
+        char *key_tag = strstr(parsed_string, "client-key");
+        if (key_tag) {
+            if (sscanf(key_tag, "client-key\":\"%32[0-9a-f]", extracted_key) == 1) {
+                printf("\n==================================================\n");
+                printf("PAIRING KEY RETRIEVED: \n");
+                printf("%s\n", extracted_key);
+                printf("==================================================\n\n");
+            } else {
+                fprintf(stderr, "[ERROR] String layout matched key_tag but sscanf parsing rules failed.\n");
+            }
+        } else {
+            fprintf(stderr, "[ERROR] key_tag pattern missing from response layout string:\n%s\n", parsed_string);
+        }
+    }
+    return extracted_key;
+}
+
 int main(int argc, char *argv[]) {
     if (argc != 2 && argc != 4) {
         fprintf(stderr, "Usage:\n");
@@ -360,14 +388,17 @@ int main(int argc, char *argv[]) {
     if (argc == 4) {
         pairing_key = argv[2];
         stream_url = argv[3];
-        has_key = (strlen(pairing_key) > 0 && strcasecmp(pairing_key, "NONE") != 0);
+        has_key = (strcasecmp(pairing_key, "NONE") != 0);
     }
 
-    int is_stop_cmd = (strlen(stream_url) > 0 && (strcasecmp(stream_url, "STOP") == 0));
-    int is_vol_up   = (strlen(stream_url) > 0 && (strcasecmp(stream_url, "VOL+") == 0));
-    int is_vol_down = (strlen(stream_url) > 0 && (strcasecmp(stream_url, "VOL-") == 0));
-    //int is_pause = (strlen(stream_url) > 0 && (strcasecmp(stream_url, "PAUSE") == 0));
-    //int is_play = (strlen(stream_url) > 0 && (strcasecmp(stream_url, "PLAY") == 0));
+    int is_stop_cmd = (strcasecmp(stream_url, "STOP") == 0);
+    int is_vol_up   = (strcasecmp(stream_url, "VOL+") == 0);
+    int is_vol_down = (strcasecmp(stream_url, "VOL-") == 0);
+    //int is_pause = (strcasecmp(stream_url, "PAUSE") == 0);
+    //int is_play = (strcasecmp(stream_url, "PLAY") == 0);
+
+    int is_wake_up = (strcasecmp(stream_url, "WAKE") == 0);
+    int is_stream_cmd = !(is_stop_cmd || is_vol_up || is_vol_down || is_wake_up);
     
     char tv_url[256];
     snprintf(tv_url, sizeof(tv_url), "https://%s:3001/", tv_ip);
@@ -440,7 +471,9 @@ int main(int argc, char *argv[]) {
     //  Create a fresh clean TV master curl handle
     // =========================================================================
     // This handle is now guaranteed to be 100% unpolluted by internet HTTP states
-    CURL *curl = curl_easy_init();
+    CURL *curl;
+ WAKE_UP:    
+    curl = curl_easy_init();
     if (!curl) {
         fprintf(stderr, "[ERROR] Failed to initialize TV curl object.\n");
         curl_global_cleanup();
@@ -497,6 +530,9 @@ int main(int argc, char *argv[]) {
             curl_easy_cleanup(curl);
             return 1;
         }
+	else {
+	  // printf("[DEBUG] TV RSP:\n%s\n", response_buf);
+	}
     }
     printf("[DEBUG] WebSocket handshake verified and approved.\n");
 
@@ -535,16 +571,27 @@ int main(int argc, char *argv[]) {
     
     send_raw_ws_frame(curl, auth_payload);
     
-    char *parsed_string = NULL;
     printf("[DEBUG] Waiting for TV to authorize secure session token...\n");
 
     int loop_running = 1;
     int registered_confirmed = 0;
 
+    // Define a zero-dependency 65-second time ceiling for human interaction
+    // (65 seconds * 10 iterations per second = 650 max retries)
+    int elapsed_cycles = 0;
+    const int MAX_PAIRING_CYCLES = 650; // The TV will timeout Accept/Cancel at 60 secs.
+
     do {
         res = curl_easy_recv(curl, response_buf, sizeof(response_buf) - 1, &bytes_read);
+	// Handle the half-open socket / idle loop safely
         if (res == CURLE_AGAIN) {
-            usleep(50000); 
+            elapsed_cycles++;
+            if (elapsed_cycles > MAX_PAIRING_CYCLES) {
+                fprintf(stderr, "[ERROR] Human pairing window timed out (65s ceiling reached).\n");
+                loop_running = 0;
+                break;
+            }
+            usleep(100000); // Sleep 100ms per cycle to keep Z2 CPU usage at 0%
             continue;
         }
         
@@ -552,10 +599,23 @@ int main(int argc, char *argv[]) {
             response_buf[bytes_read] = '\0';
             char *json_segment = response_buf + 2;
             
-            printf("[DEBUG TV FRAME]: %s\n", json_segment);
+            printf("[DEBUG] TV FRAME: %s\n", json_segment);
 
+            // Explicit Error Check: TV sent a refusal frame before disconnecting
+            if (strstr(json_segment, "\"error\"") || strstr(json_segment, "denied")) {
+                fprintf(stderr, "[ERROR] Pairing explicitly rejected by user on-screen.\n");
+                loop_running = 0;
+                break;
+            }
+	    
             if (!has_key && (strstr(json_segment, "client-key") != NULL || strstr(json_segment, "\"registered\"") != NULL)) {
-                parsed_string = strdup(json_segment);
+                pairing_key = get_key(json_segment);
+                if (strlen(stream_url)) { // Try again with KEY if stream url supplied with "NONE" key.
+		    curl_easy_reset(curl); 
+		    curl_easy_cleanup(curl);
+		    has_key = 1;
+		    goto WAKE_UP;
+		}
                 loop_running = 0;
             }
             
@@ -564,6 +624,9 @@ int main(int argc, char *argv[]) {
                 registered_confirmed = 1;
                 loop_running = 0; 
             }
+            else if (strstr(json_segment, "Try Again Later") != NULL) {
+                loop_running = 0; 
+	    }	      
         } else if (res != CURLE_OK) {
             fprintf(stderr, "[ERROR] Network stream read fault code: %s\n", curl_easy_strerror(res));
             loop_running = 0;
@@ -654,33 +717,6 @@ int main(int argc, char *argv[]) {
 
     curl_easy_cleanup(curl);
     curl_global_cleanup();
-
-    if (parsed_string != NULL) {
-        for (size_t i = 0; parsed_string[i] != '\0'; i++) {
-            if (parsed_string[i] >= 'A' && parsed_string[i] <= 'Z') {
-                parsed_string[i] = parsed_string[i] + 32;
-            }
-        }
-
-        char *key_tag = strstr(parsed_string, "client-key");
-        if (key_tag) {
-            char extracted_key[64]; 
-            memset(extracted_key, 0, sizeof(extracted_key));
-
-            if (sscanf(key_tag, "client-key\":\"%32[0-9a-f]", extracted_key) == 1) {
-                printf("\n==================================================\n");
-                printf("PAIRING KEY RETRIEVED NATIVELY VIA STRDUP:\n");
-                printf("%s\n", extracted_key);
-                printf("==================================================\n\n");
-            } else {
-                fprintf(stderr, "[ERROR] String layout matched key_tag but sscanf parsing rules failed.\n");
-            }
-        } else {
-            fprintf(stderr, "[ERROR] key_tag pattern missing from response layout string:\n%s\n", parsed_string);
-        }
-
-        free(parsed_string); 
-    }
 
     return 0;
 }
