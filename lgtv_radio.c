@@ -3,11 +3,10 @@
 #include <string.h>
 #include <strings.h>
 #include <unistd.h>
-#include <curl/curl.h>
-
 #include <sys/socket.h>
 #include <arpa/inet.h>
-#include <sys/select.h>
+#include <net/if_arp.h>
+#include <curl/curl.h>
 
 #define RESPONSE_BUF_SIZE 2048
 #define MAX_URL_SIZE 1024
@@ -15,6 +14,7 @@
 #define MULTICAST_IP "239.255.255.250"
 #define MULTICAST_PORT 1900
 
+//****************************************************************************************
 int dlna_scan() {
     int sock = socket(AF_INET, SOCK_DGRAM, 0);
     if (sock < 0) return 1;
@@ -131,7 +131,116 @@ int dlna_scan() {
     return 0;
 }
 
+//****************************************************************************************
+/**
+ * Sends a Wake-on-LAN Magic Packet to wake the TV from Standby.
+ * @param mac_str The MAC address formatted as "AA:BB:CC:DD:EE:FF" or "AA-BB-CC-DD-EE-FF"
+ * @return 0 on success, -1 on failure
+ */
+int send_wake_on_lan(const char *mac_str) {
+    unsigned char mac[6];
+    unsigned char packet[102];
+    int sock;
+    struct sockaddr_in broadcast_addr;
+    int broadcast_permission = 1;
 
+    // Parse the MAC address string into bytes
+    if (sscanf(mac_str, "%hhx:%hhx:%hhx:%hhx:%hhx:%hhx",
+               &mac[0], &mac[1], &mac[2], &mac[3], &mac[4], &mac[5]) != 6 &&
+        sscanf(mac_str, "%hhx-%hhx-%hhx-%hhx-%hhx-%hhx",
+               &mac[0], &mac[1], &mac[2], &mac[3], &mac[4], &mac[5]) != 6) {
+        fprintf(stderr, "[ERROR] Invalid MAC address format. Use AA:BB:CC:DD:EE:FF\n");
+        return -1;
+    }
+
+    // Build the Magic Packet payload: 6 bytes of 0xFF followed by MAC * 16
+    memset(packet, 0xFF, 6);
+    for (int i = 1; i <= 16; i++) {
+        memcpy(&packet[i * 6], mac, 6);
+    }
+
+    // Create a standard UDP socket
+    sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (sock < 0) {
+        perror("[ERROR] Failed to create WoL socket");
+        return -1;
+    }
+
+    // Enable network broadcast privileges on the socket
+    if (setsockopt(sock, SOL_SOCKET, SO_BROADCAST, &broadcast_permission, sizeof(broadcast_permission)) < 0) {
+        perror("[ERROR] Failed to set broadcast option");
+        close(sock);
+        return -1;
+    }
+
+    // Configure target destination to the global broadcast address on Port 9
+    memset(&broadcast_addr, 0, sizeof(broadcast_addr));
+    broadcast_addr.sin_family = AF_INET;
+    broadcast_addr.sin_port = htons(9);
+    broadcast_addr.sin_addr.s_addr = htonl(INADDR_BROADCAST);
+
+    // Blast the packet out to the network
+    printf("[DEBUG] Broadcasting Wake-on-LAN magic packet to %s...\n", mac_str);
+    if (sendto(sock, packet, sizeof(packet), 0, (struct sockaddr *)&broadcast_addr, sizeof(broadcast_addr)) < 0) {
+        perror("[ERROR] Failed to transmit WoL broadcast packet");
+        close(sock);
+        return -1;
+    }
+
+    close(sock);
+    return 0;
+}
+
+//****************************************************************************************
+/**
+ * Linux file-scraping MAC lookup.
+ * Completely avoids ioctl interface name validation bugs.
+ * @param ip_target The TV IP address (e.g. "192.168.1.50")
+ * @param mac_buffer Buffer to store output string (min 18 bytes)
+ * @return 0 on success, -1 on failure
+ */
+int resolve_ip_to_mac(const char *ip_target, char *mac_buffer) {
+    FILE *fp = fopen("/proc/net/arp", "r");
+    if (!fp) {
+        // Fallback for extreme busybox/minimal environments
+        fprintf(stderr, "[ERROR] Could not read system ARP table directly.\n");
+        return -1;
+    }
+
+    char ip[64];
+    char hw_type[16];
+    char flags[16];
+    char mac[64];
+    char mask[16];
+    char device[64];
+    int found = 0;
+
+    // Flush the header line out of the buffer pipeline
+    char buffer[256];
+    if (fgets(buffer, sizeof(buffer), fp) == NULL) {
+        fclose(fp);
+        return -1;
+    }
+
+    // Read through entries. Since curl already successfully talked to the TV,
+    // the IP address and its matching MAC are guaranteed to be in this file.
+    while (fscanf(fp, "%63s %15s %15s %63s %15s %15s", ip, hw_type, flags, mac, mask, device) == 6) {
+        if (strcmp(ip, ip_target) == 0) {
+            // "0x0" flags mean an incomplete/stale lookup. We want an active binding.
+            if (strcmp(flags, "0x0") != 0 && strlen(mac) >= 17) {
+                strncpy(mac_buffer, mac, 17);
+                mac_buffer[17] = '\0';
+                found = 1;
+                break;
+            }
+        }
+    }
+
+    fclose(fp);
+    return found ? 0 : -1;
+}
+
+//****************************************************************************************
 void send_raw_ws_frame(CURL *curl, const char *payload) {
     size_t len = strlen(payload);
     size_t max_frame_size = len + 10;
@@ -336,6 +445,7 @@ int raw_socket_recv(CURL *curl, char *output_buf, size_t max_size) {
  * "{\"type\":\"request\",\"id\":\"zip_auth\",\"uri\":\"ssap://audio/setMute\",\"payload\":{\"mute\":true}}"
  */
 
+//****************************************************************************************
 char *get_key(char * parsed_string) {
     static char extracted_key[64];
 
@@ -363,6 +473,10 @@ char *get_key(char * parsed_string) {
     }
     return extracted_key;
 }
+
+//****************************************************************************************
+
+char tv_mac[18];
 
 int main(int argc, char *argv[]) {
     if (argc != 2 && argc != 4) {
@@ -467,12 +581,30 @@ int main(int argc, char *argv[]) {
     }
 #endif // DIG_DEEPER
     
+    CURL *curl;
+ WAKE_UP:    
+    if (is_wake_up) {
+        printf("[DEBUG] Attempting Wake-on-LAN for %s\n", tv_ip);
+        if (resolve_ip_to_mac(tv_ip, tv_mac) != 0) {
+            fprintf(stderr, "[ERROR] Failed to read primed ARP cache.\n");
+	    return 1;
+        }
+	printf("[DEBUG] Resolved TV to MAC: %s\n", tv_mac);
+
+        // Send the WoL broadcast to ensure the TV's application layer boots up
+        if (send_wake_on_lan(tv_mac) != 0) {
+            fprintf(stderr, "[ERROR] Wake-on-LAN failed.\n");
+            return 1;
+	}
+
+        printf("\n[DEBUG] Waiting 25 secs for EWS to spin up...\n\n");
+        sleep(25);     //usleep(3500000);
+    }
+
     // =========================================================================
     //  Create a fresh clean TV master curl handle
     // =========================================================================
     // This handle is now guaranteed to be 100% unpolluted by internet HTTP states
-    CURL *curl;
- WAKE_UP:    
     curl = curl_easy_init();
     if (!curl) {
         fprintf(stderr, "[ERROR] Failed to initialize TV curl object.\n");
@@ -639,13 +771,36 @@ int main(int argc, char *argv[]) {
         }
     } while (loop_running);
 
+    // If requested <COMMAND> is WAKE then MUTE, go HOME, and Quit.
+    if (is_wake_up && strcasecmp(stream_url, "WAKE") == 0) { 
+        printf("[DEBUG] Muting...\n");
+        // Forcefully mute the audio immediately upon connection
+        char *mute_payload = "{\"id\":\"z2_mute_cmd\",\"type\":\"request\",\"uri\":\"ssap://audio/setMute\",\"payload\":{\"mute\":true}}";
+        send_raw_ws_frame(curl, mute_payload);
+
+        printf("[DEBUG] Launching [HOME]...\n");
+        char *home_payload = "{"
+          "\"id\":\"z2_home_cmd\","
+          "\"type\":\"request\","
+          "\"uri\":\"ssap://system.launcher/launch\","
+          "\"payload\":{\"id\":\"com.webos.app.home\"}"
+          "}";
+        send_raw_ws_frame(curl, home_payload);
+
+        printf("[DEBUG] Ready...\n");
+	curl_easy_cleanup(curl);
+	curl_global_cleanup();
+	
+	return 0;
+    }
+
     // Give webOS .5 sec to finalize the session token authorization before app launch.
     // (avoids a 401 error)
     //usleep(250000);
     usleep(500000);
     //usleep(1250000);
 
-    // 3. Transmit Play or Stop Command String
+    // Transmit Play or Stop Command String
     if (strlen(stream_url) > 0 && registered_confirmed) {
         char cmd_payload[RESPONSE_BUF_SIZE];
         if (is_stop_cmd) {
